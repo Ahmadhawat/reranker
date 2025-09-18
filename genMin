@@ -1,19 +1,38 @@
-# CllmAnswerMinimal.py
+# src/search_steps/impls/generate_answer/CllmAnswerer.py
 from __future__ import annotations
+
 import requests
 from pathlib import Path
 from typing import List
 
-TEMPERATURE = 0.2
-MAX_TOKENS  = 800
-MAX_CTX_CHARS = 18000           # hard cap for all file text sent to LLM
-K_FILES = 20                    # max files from copy_dir
+try:
+    # use your project logging/context if available
+    from src.pipeline.context import Context
+    from src.utils.logging import get_logger
+except Exception:
+    class Context:
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self.artifacts = {}
+    def get_logger(name):
+        import logging
+        logging.basicConfig(level=logging.INFO)
+        return logging.getLogger(name)
+
+# ----- knobs (align with your style) ---------------------------------
+TEMPERATURE     = 0.2
+MAX_TOKENS      = 800
+MAX_CTX_CHARS   = 18_000
+K_FILES         = 20
+PROV_MARK       = "PROVENANCE-SOURCE-PATH"
 
 SYSTEM_PROMPT = (
     "Du bist ein technischer Assistent. "
     "Beantworte die Frage NUR basierend auf den bereitgestellten Dateien. "
-    "Wenn Info fehlt, sag das klar."
+    "Wenn Informationen fehlen, sag das klar."
 )
+
+# ---------------- helpers ----------------
 
 def _read_text_safe(p: Path) -> str:
     try:
@@ -21,22 +40,30 @@ def _read_text_safe(p: Path) -> str:
     except Exception:
         return p.read_text(encoding="utf-8", errors="ignore")
 
-def _strip_provenance_header(text: str) -> str:
-    if "PROVENANCE-SOURCE-PATH" in text[:500]:
-        lines = text.splitlines()
-        return "\n".join(lines[1:]) if lines else text
-    return text
+def _strip_header(t: str) -> str:
+    # remove the provenance header line if present at the top
+    if PROV_MARK in t[:500]:
+        lines = t.splitlines()
+        return "\n".join(lines[1:]) if len(lines) > 1 else ""
+    return t
 
 def _gather_files(copy_dir: str, k: int) -> List[Path]:
     d = Path(copy_dir)
-    files = [p for p in d.iterdir() if p.is_file() and p.suffix.lower() not in {".json", ".png", ".jpg", ".jpeg"}]
-    files = [p for p in files if p.name != "manifest.json"]
+    if not d.exists():
+        return []
+    files = [
+        p for p in d.iterdir()
+        if p.is_file()
+        and p.name != "manifest.json"
+        and p.suffix.lower() not in {".json", ".png", ".jpg", ".jpeg", ".gif"}
+    ]
     files.sort()
     return files[:k]
 
 def _truncate(s: str, limit: int) -> str:
     if len(s) <= limit:
         return s
+    # keep head & tail to preserve some context
     head = s[: int(limit * 0.8)]
     tail = s[-int(limit * 0.15):]
     return head + "\n...\n" + tail
@@ -44,7 +71,8 @@ def _truncate(s: str, limit: int) -> str:
 def _build_user_prompt(query: str, file_blocks: str) -> str:
     return (
         f"Frage: {query}\n\n"
-        "Du bekommst Dateien. Antworte kurz, korrekt, mit Schrittfolge wenn sinnvoll.\n\n"
+        "Antwortregeln: Knapp, korrekt; Schrittfolge falls sinnvoll. "
+        "Belege Aussagen mit [n], wobei n die Dateinummer ist.\n\n"
         f"Dateien:\n{file_blocks}\n"
     )
 
@@ -59,64 +87,117 @@ def _call_llm(api_url: str, api_key: str, model: str, system: str, user: str) ->
         "temperature": TEMPERATURE,
         "max_tokens": MAX_TOKENS,
     }
-    resp = requests.post(api_url, headers=headers, json=payload, timeout=60)
-    if resp.status_code != 200:
-        print(f"[HTTP ERROR] {resp.status_code}: {resp.text[:200]}")
+    try:
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=60)
+
+        if resp.status_code == 401:
+            print("[AUTH ERROR] Ungültiger oder abgelaufener API-Key.")
+            return ""
+        if resp.status_code in (404, 405):
+            print(f"[URL ERROR] API-URL '{api_url}' nicht erreichbar oder falsch.")
+            return ""
+        if resp.status_code == 400 and "model" in (resp.text or "").lower():
+            print("[MODEL ERROR] Ungültiger Modellname.")
+            return ""
+        if not (200 <= resp.status_code < 300):
+            print(f"[HTTP ERROR] {resp.status_code}: {resp.text[:200]}")
+            return ""
+
+        data = resp.json()
+        return (
+            data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+        )
+    except requests.exceptions.MissingSchema:
+        print(f"[URL ERROR] Ungültige API-URL '{api_url}'.")
         return ""
-    data = resp.json()
-    return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+    except requests.exceptions.ConnectionError:
+        print(f"[CONNECTION ERROR] Keine Verbindung zur API unter '{api_url}'.")
+        return ""
+    except Exception as e:
+        print(f"[EXCEPTION] Unerwarteter Fehler: {e}")
+        return ""
 
-class LLMAnswerMinimal:
+# ---------------- pipeline step ----------------
+
+class CllmAnswerer:
     """
-    Usage:
-      step = LLMAnswerMinimal()
-      step.run(ctx)  # prints the answer
-    Expects in ctx.cfg:
-      paths.copy_dir
-      query.text
-      query.API_URL, query.API_KEY, query.MODEL_NAME
-      (optional) answer.k, answer.max_ctx_chars
+    Minimal answer generation step.
+
+    Reads:
+      - cfg.paths.copy_dir
+      - query: prefers ctx.artifacts['corrected_query'], else cfg.query.text
+      - API:  cfg.answer.{API_URL,API_KEY,MODEL_NAME} (fallback to cfg.query.*)
+
+    Behavior:
+      - loads up to K_FILES files from copy_dir,
+      - builds prompt (files + query) under MAX_CTX_CHARS budget,
+      - calls LLM,
+      - prints answer and stores it in ctx.artifacts['final_answer'].
     """
-    name = "LLM_Answer_Minimal"
+    name = "generate_answer_llm"
 
-    def run(self, ctx) -> None:
-        copy_dir      = ctx.cfg["paths"]["copy_dir"]
-        query_text    = (ctx.cfg.get("answer", {}).get("query_text")
-                         or ctx.cfg.get("query", {}).get("text") or "").strip()
-        api_url       = ctx.cfg["query"]["API_URL"]
-        api_key       = ctx.cfg["query"]["API_KEY"]
-        model_name    = ctx.cfg["query"]["MODEL_NAME"]
-        k             = int(ctx.cfg.get("answer", {}).get("k", K_FILES))
-        max_ctx_chars = int(ctx.cfg.get("answer", {}).get("max_ctx_chars", MAX_CTX_CHARS))
+    def run(self, ctx: "Context") -> None:
+        log = get_logger(self.name)
 
-        if not (query_text and api_url and api_key and model_name):
-            print("[CONFIG ERROR] Missing query or API settings.")
+        cfg         = ctx.cfg
+        paths       = cfg["paths"]
+        copy_dir    = paths["copy_dir"]
+
+        # query text: prefer corrected query from previous step
+        query_text = (
+            ctx.artifacts.get("corrected_query")
+            or cfg.get("answer", {}).get("query_text")
+            or cfg.get("query", {}).get("text", "")
+        ).strip()
+        if not query_text:
+            log.warning("No query text found (ctx.artifacts.corrected_query / cfg.query.text).")
             return
 
-        files = _gather_files(copy_dir, k)
+        # API settings: answer.* overrides query.*
+        api_url    = cfg.get("answer", {}).get("API_URL")   or cfg.get("query", {}).get("API_URL")
+        api_key    = cfg.get("answer", {}).get("API_KEY")   or cfg.get("query", {}).get("API_KEY")
+        model_name = cfg.get("answer", {}).get("MODEL_NAME")or cfg.get("query", {}).get("MODEL_NAME")
+        if not (api_url and api_key and model_name):
+            log.warning("Missing API settings (API_URL/API_KEY/MODEL_NAME).")
+            return
+
+        # limits
+        k_files        = int(cfg.get("answer", {}).get("k", K_FILES))
+        max_ctx_chars  = int(cfg.get("answer", {}).get("max_ctx_chars", MAX_CTX_CHARS))
+
+        # collect files
+        files = _gather_files(copy_dir, k_files)
         if not files:
-            print("[DATA] No files in copy_dir.")
-        
-        # build file blocks with global budget
+            log.info("No files found in copy_dir: %s", copy_dir)
+
+        # render file blocks under global budget
         remaining = max_ctx_chars
-        blocks = []
+        blocks: List[str] = []
         for i, p in enumerate(files, start=1):
-            raw = _strip_provenance_header(_read_text_safe(p))
             header = f"\n[{i}] {p.name}\n---\n"
-            budget_for_this = max(0, remaining - len(header) - 200)  # 200 chars safety
+            text   = _strip_header(_read_text_safe(p))
+            # keep a small per-item safety margin
+            budget_for_this = max(0, remaining - len(header) - 200)
             if budget_for_this <= 0:
                 break
-            body = _truncate(raw, budget_for_this)
-            block = header + body
+            body   = _truncate(text, budget_for_this)
+            block  = header + body
             blocks.append(block)
             remaining -= len(block)
 
-        file_blocks = "".join(blocks).strip()
-        user_prompt = _build_user_prompt(query_text, file_blocks if file_blocks else "(keine Dateien)")
+        file_blocks = "".join(blocks).strip() or "(keine Dateien)"
+        user_prompt = _build_user_prompt(query_text, file_blocks)
 
+        # call model
         answer = _call_llm(api_url, api_key, model_name, SYSTEM_PROMPT, user_prompt)
+
         if answer:
             print("\n===== ANSWER =====\n")
             print(answer)
+            ctx.artifacts["final_answer"] = answer
         else:
             print("[LLM] Empty answer.")
+            ctx.artifacts["final_answer"] = ""
