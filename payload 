@@ -31,57 +31,71 @@ def _gather_files(copy_dir: str, k: int) -> List[Path]:
     return files[:k]
 
 def _normalize_newlines(text: str) -> str:
-    """Collapse multiple blank lines into a single blank line."""
-    # Replace Windows line endings first
+    # normalize line endings
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Collapse more than 2 newlines into exactly 2
-    return re.sub(r"\n\s*\n+", "\n\n", text)
+    # collapse 2+ blank lines to exactly one blank line
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    # strip leading/trailing blank lines
+    return text.strip("\n")
+
+def _wrap_brackets(text: str) -> str:
+    return "[\n" + text + "\n]"
 
 def make_payload_text(copy_dir: str, query: str, k: int = 20, max_chars: int = 18_000) -> str:
     """
-    Build the payload text similar to the example in your screenshot.
-    - Uses the provenance header already inside each file (no duplicate).
-    - Cleans up multiple blank lines.
-    - Trims total payload to `max_chars`.
+    Build payload:
+      - Header + Frage + Dateien:
+      - For each file: `file:i.` then the file content wrapped in `[ ... ]`
+      - Single blank line between blocks
+      - No duplicate provenance, we use file content as-is
+      - Global char cap (always closes the bracket)
     """
     header = f"{INSTRUCTIONS}\n\nFrage: [{query} ]\n\nDateien:\n"
     remaining = max_chars - len(header)
     if remaining <= 0:
-        return header.rstrip()
+        return header.rstrip() + "\n"
 
     blocks: List[str] = []
-    files = _gather_files(copy_dir, k)
-    if not files:
-        return header + "(keine Dateien gefunden)"
-
-    for i, p in enumerate(files, start=1):
-        text = _read_text_safe(p)
-        if not text:
+    for i, p in enumerate(_gather_files(copy_dir, k), start=1):
+        raw = _read_text_safe(p)
+        if not raw:
             continue
+        text = _normalize_newlines(raw)
 
-        # Clean newlines
-        text = _normalize_newlines(text)
+        # Start building the block (we add exactly one trailing blank line later)
+        block_prefix = f"file:{i}.\n"
+        bracket_open  = "[\n"
+        bracket_close = "\n]"
+        fixed_overhead = len(block_prefix) + len(bracket_open) + len(bracket_close) + 1  # +1 for the final newline
 
-        # Prefix only the file marker (no extra provenance line)
-        block_header = f"\nfile:{i}.\n"
-
-        # Budget per file
-        budget = remaining - len(block_header)
-        if budget <= 0:
+        # If not enough room for any content + overhead, stop.
+        if remaining <= fixed_overhead:
             break
 
-        body = text if len(text) <= budget else text[:budget]
-        block = block_header + body + "\n"
+        # Budget for the body
+        body_budget = remaining - fixed_overhead
+
+        if len(text) > body_budget:
+            # Keep head and tail, but ensure we can still place ellipsis and close bracket
+            head = text[: int(body_budget * 0.85)]
+            tail = text[-max(0, int(body_budget * 0.10)) :]
+            # Ensure total <= body_budget (reserve 4 for "\n...\n")
+            ellipsis = "\n...\n" if body_budget >= 4 else ""
+            body = (head + ellipsis + tail)[:body_budget]
+        else:
+            body = text
+
+        block = block_prefix + bracket_open + body + bracket_close + "\n"  # exactly one blank line after
         blocks.append(block)
         remaining -= len(block)
-
         if remaining <= 0:
             break
 
     payload = header + "".join(blocks)
+    # Final safety trim while keeping structure; if cut, try to end on newline.
     if len(payload) > max_chars:
-        payload = payload[: max_chars - 4] + "...\n"
-    return payload.rstrip() + "\n"
+        payload = payload[: max_chars - 1] + "\n"
+    return payload
 
 def make_payload_file(copy_dir: str, query: str, out_file: str,
                       k: int = 20, max_chars: int = 18_000) -> str:
