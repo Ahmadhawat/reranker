@@ -1,89 +1,55 @@
-# src/search_steps/impls/reranking/CrossEncoderReranking.py
+# src/search_steps/impls/reranking/CrossEncoder.py
 from __future__ import annotations
 
 import json
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple, Optional
+from typing import Dict, Iterable, List, Tuple
 
-import numpy as np
 from sentence_transformers import CrossEncoder
+from src.search_steps.impls.reranking.CrerankingABS import Reranking
+from src.pipeline.Context import Context
+from src.utils.logging import get_logger
 
 
-class CrossEncoderReranking:
-    """
-    Reranks top-N retrieved chunks using a multilingual cross-encoder
-    (default: BAAI/bge-reranker-v2-m3) with:
-      - text cleaning (fix PDF hyphenation, collapse newlines)
-      - sentence/short-window scoring and max aggregation per chunk
-      - tiny German query expansion for compounds (optional)
-      - optional blending with retriever score (RRF/BM25) to keep exact matches strong
-    """
-
+class CrossEncoderReranking(Reranking):
     name = "cross_encoder_rerank"
 
-    # ---------------------
-    # Config defaults
-    # ---------------------
-    DEFAULT_MODEL = "BAAI/bge-reranker-v2-m3"
-    DEFAULT_TOPK = 10
-    DEFAULT_WINDOW_TOKENS = 180      # approximate “tokens” using words
-    DEFAULT_ALPHA = 0.65             # weight for CE vs retriever when blending
+    # ---------------- helpers ----------------
+    def _load_model(self, model_name: str) -> CrossEncoder:
+        if CrossEncoder is None:
+            raise RuntimeError("sentence-transformers not available.")
+        print(f"Loading cross-encoder: {model_name}")
+        return CrossEncoder(model_name, max_length=512)  # keep softmax=False for BGE
 
-    # ---------------------
-    # Public API
-    # ---------------------
-    def __init__(self, cfg: Dict):
-        self.cfg = cfg
-        rerank_cfg = cfg.get("rerank", {})
-        self.model_name: str = str(rerank_cfg.get("model_name", self.DEFAULT_MODEL))
-        self.top_k: int = int(rerank_cfg.get("top_k", self.DEFAULT_TOPK))
-        self.window_tokens: int = int(rerank_cfg.get("window_tokens", self.DEFAULT_WINDOW_TOKENS))
-        self.alpha: float = float(rerank_cfg.get("alpha", self.DEFAULT_ALPHA))
-        self.hybrid_json_path = Path(cfg.get("paths", {}).get("hybrid_results_path", "hybrid_results.json"))
-
-        self._logger = cfg.get("_logger") or (lambda *a, **k: None)  # fallback: no-op
-
-        self.model: Optional[CrossEncoder] = None  # lazy-loaded
-
-    # ---------------------
-    # Helpers
-    # ---------------------
     @staticmethod
     def _clean(text: str) -> str:
-        """Light cleanup that helps CEs a lot on German OCR/PDF text."""
-        t = text.replace("-\n", "")            # fix PDF line-break hyphenation
+        """Fix PDF hyphenation and collapse ugly newlines while keeping paragraphs."""
+        t = text.replace("-\n", "")
         t = t.replace("\r", "\n")
         t = "\n".join(line.strip() for line in t.splitlines())
-        # drop excessive blank paragraphs but keep paragraph boundaries
         t = "\n\n".join(p for p in t.split("\n\n") if p.strip())
         return t
 
-    def _windows(self, text: str) -> List[str]:
-        """
-        Split into sentence-ish windows ~ self.window_tokens words with small overlap.
-        Using words as a simple proxy for tokens keeps it dependency-free.
-        """
+    @staticmethod
+    def _windows(text: str, approx_tokens: int) -> List[str]:
+        """Split into sentence-ish windows ~approx_tokens words with small overlap."""
         sents = re.split(r"(?<=[.!?:;])\s+", text)
         blocks, cur, wc = [], [], 0
         for s in sents:
             cur.append(s)
             wc += len(s.split())
-            if wc >= self.window_tokens:
+            if wc >= approx_tokens:
                 blocks.append(" ".join(cur))
                 # keep last sentence as overlap
                 cur, wc = cur[-1:], len(cur[-1].split())
         if cur:
             blocks.append(" ".join(cur))
-        # fallback
         return blocks or [text]
 
     @staticmethod
     def _de_query_variants(q: str) -> List[str]:
-        """
-        Tiny, safe expansion to bridge common German compounds in this domain.
-        We aggregate by MAX across these variants, so precision is preserved.
-        """
+        """Tiny German compound expansion; we aggregate by MAX so precision is kept."""
         variants = [q]
         ql = q.lower()
         extra: List[str] = []
@@ -94,136 +60,113 @@ class CrossEncoderReranking:
         if "plot" in ql or "plotten" in ql:
             extra += ["zeichnen", "darstellen", "plot", "erstellen"]
         if extra:
-            variants.append(q + " (" + " ".join(extra[:6]) + ")")  # keep concise
+            variants.append(q + " (" + " ".join(extra[:6]) + ")")
         return variants
 
     @staticmethod
-    def _norm(a: Iterable[float]) -> np.ndarray:
-        a = np.asarray(list(a), dtype=float)
-        rng = a.max() - a.min()
-        return (a - a.min()) / (rng + 1e-9)
+    def _norm(a: Iterable[float]) -> List[float]:
+        a = list(float(x) for x in a)
+        if not a:
+            return a
+        mn, mx = min(a), max(a)
+        rng = mx - mn
+        return [(x - mn) / (rng + 1e-9) for x in a]
 
-    def _load_model(self) -> CrossEncoder:
-        if self.model is None:
-            self._logger(f"[INFO] Loading cross-encoder: {self.model_name}")
-            self.model = CrossEncoder(self.model_name, max_length=512)  # keep softmax=False for BGE
-        return self.model
+    # ---------------- main ----------------
+    def run(self, ctx: "Context") -> None:
+        log = get_logger(self.name)
 
-    # ---------------------
-    # Core scoring
-    # ---------------------
-    def _score_chunk(self, query: str, text: str) -> float:
-        """
-        Score one chunk by:
-          - cleaning text
-          - making windows
-          - building (query_variant, window) pairs
-          - predicting in one batch
-          - returning MAX score across all pairs
-        """
-        model = self._load_model()
-        wt = self._windows(self._clean(text))
-        qvars = self._de_query_variants(query)
-        pairs = [(qv, w) for qv in qvars for w in wt]
-        scores = model.predict(pairs, batch_size=32)  # logits; higher = better
-        return float(np.max(scores))
+        cfg = ctx.cfg
+        paths = cfg["paths"]
+        hybrid_json_path = Path(paths["hybrid_results_path"])
 
-    # ---------------------
-    # Runner
-    # ---------------------
-    def run(self, ctx, cfx: "Context" = None) -> None:
-        """
-        Expects a 'hybrid_results.json' with:
-        {
-          "query": "...",
-          "results": [
-             {"chunkpath": "...", "rrf_score": 0.015, "bm25_rank": 3, ...},
-             ...
-          ]
-        }
-        """
-        logger = self._logger
+        # config knobs (with safe defaults)
+        rerank_cfg: Dict[str, object] = cfg.get("rerank", {})
+        model_name = str(rerank_cfg.get("model_name", "BAAI/bge-reranker-v2-m3"))
+        top_k = int(rerank_cfg.get("top_k", 10))
+        window_tokens = int(rerank_cfg.get("window_tokens", 180))
+        alpha = float(rerank_cfg.get("alpha", 0.65))  # CE weight vs retriever
 
-        # Load hybrid results
-        if not self.hybrid_json_path.exists():
-            raise FileNotFoundError(f"Hybrid results not found: {self.hybrid_json_path}")
-        with self.hybrid_json_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        query: str = data.get("query") or (ctx and getattr(ctx, "query", "")) or ""
+        # query source (keep your previous fallback order)
+        query = (
+            ctx.artifacts.get("corrected_query")
+            or cfg.get("query", {}).get("text", "")
+            or ""
+        )
         if not query.strip():
-            raise ValueError("Query text is required for cross-encoder rerank.")
+            raise ValueError("cfg.query.text is required for cross-encoder rerank.")
 
+        log.info(f"Using query: {query}")
+        log.info(f"Loading results from: {hybrid_json_path}")
+
+        # load hybrid results
+        with hybrid_json_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
         raw_results: List[Dict] = list(data.get("results", []))
         if not raw_results:
-            logger("[WARN] No results to rerank; exiting.")
+            log.warning("No results to rerank; exiting.")
             return
 
-        # Read candidates
+        # load CE
+        model = self._load_model(model_name)
+
+        # collect candidates and their retriever scores (prefer RRF)
         candidates: List[Tuple[str, str]] = []
         retriever_scores: List[float] = []
-
         for r in raw_results:
-            path = Path(r.get("chunkpath", ""))
-            if not path.exists():
-                logger(f"[WARN] Chunk file not found: {path}")
+            chunk_path = Path(r.get("chunkpath", ""))
+            if not chunk_path.exists():
+                log.warning(f"Chunk file not found: {chunk_path}")
                 continue
-            text = path.read_text(encoding="utf-8", errors="ignore").strip()
-            candidates.append((str(path), text))
-            # prefer rrf_score if present, else 0.0
+            text = chunk_path.read_text(encoding="utf-8", errors="ignore").strip()
+            candidates.append((str(chunk_path), text))
             retriever_scores.append(float(r.get("rrf_score", 0.0)))
 
         if not candidates:
-            logger("[WARN] No readable chunks; exiting.")
+            log.warning("No readable chunks; exiting.")
             return
 
-        # Score with CE (max over windows & query variants)
+        # score each chunk: clean -> windows -> (query variants x windows) -> MAX
         ce_scores: List[float] = []
-        for i, (_, txt) in enumerate(candidates, start=1):
-            s = self._score_chunk(query, txt)
-            ce_scores.append(s)
+        qvars = self._de_query_variants(query)
+
+        for i, (path, text) in enumerate(candidates, 1):
+            wt = self._windows(self._clean(text), approx_tokens=window_tokens)
+            pairs = [(qv, w) for qv in qvars for w in wt]
+            scores = model.predict(pairs, batch_size=32)  # logits; softmax=False
+            ce_scores.append(float(max(scores)))
             if i % 10 == 0 or i == len(candidates):
-                logger(f"[INFO] CE scored {i}/{len(candidates)}")
+                log.info(f"Scored {i}/{len(candidates)} with CE")
 
-        # Blend (optional) with retriever score to preserve exact matches on compounds
-        # blended = alpha * norm(CE) + (1-alpha) * norm(retriever)
-        blended = self.alpha * self._norm(ce_scores) + (1.0 - self.alpha) * self._norm(retriever_scores)
+        # blend with retriever score to preserve exact matches (esp. German compounds)
+        ce_n = self._norm(ce_scores)
+        ret_n = self._norm(retriever_scores)
+        blended = [alpha * c + (1.0 - alpha) * r for c, r in zip(ce_n, ret_n)]
 
-        # Sort & report
-        order = np.argsort(-blended)
-        top_idx = order[: self.top_k]
-        logger("[INFO] Top chunks based on reranking:")
-        for rank, i in enumerate(top_idx, 1):
-            path = candidates[i][0]
-            logger(f"[INFO] Rank {rank}: {path}  (CE: {ce_scores[i]:.6f}, blended: {blended[i]:.6f})")
+        # sort and print top-k
+        order = sorted(range(len(candidates)), key=lambda i: blended[i], reverse=True)
+        log.info("Top 10 chunks based on reranking:")
+        for rank, i in enumerate(order[:max(10, top_k)], 1):
+            log.info(
+                f"Rank {rank}: {candidates[i][0]}  "
+                f"(CE: {ce_scores[i]:.6f}, blended: {blended[i]:.6f})"
+            )
 
-        # Optionally: write out a new results file with CE/blended scores
+        # write a reranked results file next to the hybrid one
         out = {
             "query": query,
-            "model": self.model_name,
-            "alpha": self.alpha,
+            "model": model_name,
+            "alpha": alpha,
             "results": [
                 {
                     "chunkpath": candidates[i][0],
-                    "ce_score": float(ce_scores[i]),
-                    "blended_score": float(blended[i]),
-                    "rrf_score": float(retriever_scores[i]),
+                    "ce_score": ce_scores[i],
+                    "blended_score": blended[i],
+                    "rrf_score": retriever_scores[i],
                 }
-                for i in order.tolist()
+                for i in order
             ],
         }
-        out_path = self.hybrid_json_path.with_name("reranked_results.json")
+        out_path = hybrid_json_path.with_name("reranked_results.json")
         out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger(f"[INFO] Wrote: {out_path}")
-
-
-
-
-
-rerank:
-  model_name: BAAI/bge-reranker-v2-m3
-  top_k: 10
-  window_tokens: 180
-  alpha: 0.65
-paths:
-  hybrid_results_path: ./results/hybrid_results.json
+        log.info(f"Wrote: {out_path}")
