@@ -1,0 +1,107 @@
+# src/search_steps/impls/generate_answer/build_payload.py
+from __future__ import annotations
+from pathlib import Path
+from typing import List
+
+INSTRUCTIONS = (
+    "Beantworten Sie die folgende Frage ausschließlich anhand der bereitgestellten Dateien. "
+    "Wenn eine Antwort gefunden wird, geben Sie nur die Antwort und den zugehörigen Pfad aus. "
+    "Keine zusätzlichen Erklärungen oder Kommentare. Falls keine Antwort in den Dateien "
+    "enthalten ist, geben Sie nichts aus."
+)
+
+PROV_MARK = "PROVENANCE-SOURCE-PATH"
+
+def _read_text_safe(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception:
+        return p.read_text(encoding="utf-8", errors="ignore")
+
+def _gather_files(copy_dir: str, k: int) -> List[Path]:
+    d = Path(copy_dir)
+    if not d.exists():
+        return []
+    files = [
+        p for p in d.iterdir()
+        if p.is_file()
+        and p.name != "manifest.json"
+        and p.suffix.lower() not in {".json", ".png", ".jpg", ".jpeg", ".gif", ".pdf"}
+    ]
+    files.sort()
+    return files[:k]
+
+def make_payload_text(copy_dir: str, query: str, k: int = 20, max_chars: int = 18_000) -> str:
+    """
+    Build the payload text that looks like your example screenshot.
+    Keeps the provenance header line from each copied file.
+    Trims the total payload to `max_chars` (keeping a bit of each file).
+    """
+    # Header (instructions + query)
+    header = f"{INSTRUCTIONS}\n\nFrage: [{query} ]\n\nDateien:\n"
+    remaining = max_chars - len(header)
+    if remaining <= 0:
+        return header.rstrip()
+
+    blocks: List[str] = []
+    files = _gather_files(copy_dir, k)
+    if not files:
+        return header + "(keine Dateien gefunden)"
+
+    # Split budget roughly across files, but allow spillover if short
+    per_file_min = max(600, remaining // max(1, len(files)))
+
+    for i, p in enumerate(files, start=1):
+        text = _read_text_safe(p)
+
+        # Ensure the very first line with provenance is present at the top.
+        # (Your copy step already injected: "PROVENANCE-SOURCE-PATH: <path>")
+        # We do not strip it; we keep it exactly like in your screenshot.
+        if not text:
+            text = ""
+
+        # Construct the labeled block
+        prefix = f"\nfile:{i}. "
+        # If the first line doesn’t contain PROV_MARK, we fabricate a minimal one.
+        if PROV_MARK not in text.splitlines()[0:1]:
+            prefix += f"[{PROV_MARK}: {p}]"
+        block_header = prefix + "\n"
+
+        # Budgeting
+        budget = max(per_file_min, 300)  # at least some context per file
+        # Allow more if we still have room
+        budget = min(budget, remaining - len(block_header))
+        if budget <= 0:
+            break
+
+        if len(text) > budget:
+            # Keep head and tail (like your view) so headings and key bits survive
+            head = text[: int(budget * 0.85)]
+            tail = text[-int(budget * 0.10):]
+            body = head + "\n...\n" + tail
+        else:
+            body = text
+
+        block = block_header + body + "\n"
+        blocks.append(block)
+        remaining -= len(block)
+
+        if remaining <= 0:
+            break
+
+    payload = header + "".join(blocks)
+    # Safety trim if slightly over
+    if len(payload) > max_chars:
+        payload = payload[: max_chars - 4] + "...\n"
+    return payload.rstrip() + "\n"
+
+def make_payload_file(copy_dir: str, query: str, out_file: str,
+                      k: int = 20, max_chars: int = 18_000) -> str:
+    """
+    Build and write the payload to `out_file`. Returns the path written.
+    """
+    payload = make_payload_text(copy_dir=copy_dir, query=query, k=k, max_chars=max_chars)
+    out_path = Path(out_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(payload, encoding="utf-8", newline="\n")
+    return str(out_path)
