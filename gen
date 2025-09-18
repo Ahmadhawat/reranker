@@ -1,0 +1,321 @@
+Awesome—thanks for the screenshots + the helper you already have.
+Below is a drop-in “answer generation” module that mirrors your Query Rewriter style: it builds the prompt exactly like in your screenshots (German system prompt + user instructions, inline refs [n], “Sources:” list), trims the evidence to a character budget, calls your LLM over requests, and writes both the final answer and the rendered sources list into ctx.artifacts.
+
+You can put this file next to your CllmRewriter.py, e.g. CgenerateAnswerABS.py or CllmAnswerer.py.
+
+# src/search_steps/impls/generate_answer/CllmAnswerer.py
+from __future__ import annotations
+import textwrap
+import requests
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional
+
+# Reuse your constants’ spirit from the screenshots
+DEFAULT_MAX_CTX_CHARS = 18000   # budget for evidence text sent to LLM
+TEMPERATURE            = 0.2
+MAX_TOKENS             = 800
+
+SYSTEM_PROMPT = """
+Du bist ein technischer Assistent für card_1 (CAD/BIM Vermessung & Infrastruktur).
+Beantworte die Frage präzise und fachlich korrekt NUR auf Basis der bereitgestellten Quellen.
+Wenn Informationen fehlen, sag das offen.
+Nutze *Inline-Referenzen* in eckigen Klammern, z. B. [1], [2], passend zu den Quellennummern.
+Gib am Ende eine Liste "Sources:" mit den Zuordnungen [n] → Dateipfad/Chunkname aus.
+Keine Erfindungen, keine externen Annahmen.
+""".strip()
+
+USER_INSTRUCTIONS = """
+Frage: {query}
+
+Du erhältst bis zu {k} Quellen im Format:
+[n] Pfad | Chunkname
+--- Inhalt (gekürzt) ---
+
+Anweisungen:
+1) Antworte knapp, korrekt und schrittweise, wenn sinnvoll.
+2) Belege relevante Aussagen mit den Nummern in eckigen Klammern (z. B. [3]).
+3) Wenn dir Quellen fehlen, wirke inhaltlich nicht herangezogen wirken.
+4) Nenne am Ende unter "Sources:" die verwendeten Quellennummern mit Pfad/Chunkname (kein Roman).
+
+Quellen (Kontext):
+{evidence_block}
+""".strip()
+
+# --------------------------- helpers ---------------------------------
+
+def _read_text_safe(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception:
+        return p.read_text(encoding="utf-8", errors="ignore")
+
+def _shorten(s: str, limit: int) -> str:
+    if len(s) <= limit:
+        return s
+    # Keep head & tail to preserve context
+    head = s[: int(limit * 0.7)]
+    tail = s[-int(limit * 0.2) :]
+    return head + "\n...\n" + tail
+
+def _collect_evidence_from_manifest(copy_dir: str, k: int) -> List[Dict[str, str]]:
+    """
+    Reads your 'copy_dir/manifest.json' (created by your copy step) and
+    returns a list of {n, path, chunk, text}.
+    The 'chunk' will be derived from filename; path from manifest; text from the copied file.
+    """
+    manifest_path = Path(copy_dir) / "manifest.json"
+    if not manifest_path.exists():
+        return []
+
+    import json
+    manifest: Dict[str, Dict[str, str]] = json.loads(manifest_path.read_text(encoding="utf-8"))
+    items: List[Dict[str, str]] = []
+    for n, (dst, meta) in enumerate(list(manifest.items())[:k], start=1):
+        p = Path(dst)
+        text = _read_text_safe(p)
+        # remove provenance header if present (first 500 chars heuristic)
+        prov_mark = "PROVENANCE-SOURCE-PATH"
+        if prov_mark in text[:500]:
+            text = "\n".join(text.splitlines()[1:])  # drop first line/header
+        items.append({
+            "n": n,
+            "path": meta.get("source_path_html", p.name),
+            "chunk": p.stem,
+            "text": text,
+        })
+    return items
+
+def _render_evidence_block(items: List[Dict[str, str]], budget: int) -> Tuple[str, List[Tuple[int, str, str]]]:
+    """
+    Render the evidence into the prompt block while staying under `budget` characters.
+    Returns: (block_text, sources_table)
+    where sources_table = [(n, path, chunk), ...] for building the final "Sources:" list.
+    """
+    lines: List[str] = []
+    sources: List[Tuple[int, str, str]] = []
+    remaining = budget
+
+    for it in items:
+        n, path, chunk, text = it["n"], it["path"], it["chunk"], it["text"]
+        header = f"[{n}] {path} | {chunk}\n---\n"
+        # reserve a little per item for safety
+        reserve = max(600, int(0.03 * budget))
+        take = max(0, min(len(text), remaining - len(header) - reserve))
+        if take <= 0:
+            break
+        body = _shorten(text, take)
+        piece = header + body + "\n\n"
+        lines.append(piece)
+        remaining -= len(piece)
+        sources.append((n, path, chunk))
+
+    return "".join(lines).strip(), sources
+
+def _sources_footer(sources: List[Tuple[int, str, str]]) -> str:
+    if not sources:
+        return "Sources: (keine relevanten Quellen gefunden)"
+    rows = [f"[{n}] {path} ({chunk})" for (n, path, chunk) in sources]
+    return "Sources:\n" + "\n".join(rows)
+
+# ------------------------ LLM call (like your rewriter) ----------------
+
+def _call_llm(
+    api_url: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = TEMPERATURE,
+    max_tokens: int = MAX_TOKENS,
+    timeout: int = 60,
+) -> str:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    try:
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
+
+        if resp.status_code == 401:
+            print("[AUTH ERROR] Ungültiger oder abgelaufener API-Key.")
+            return ""
+        if resp.status_code in (404, 405):
+            print(f"[URL ERROR] API-URL '{api_url}' nicht erreichbar oder falsch.")
+            return ""
+        if resp.status_code == 400 and "model" in (resp.text or "").lower():
+            print(f"[MODEL ERROR] Ungültiger Modellname '{model}'.")
+            return ""
+        if not (200 <= resp.status_code < 300):
+            print(f"[HTTP ERROR] {resp.status_code}: {resp.text[:200]}")
+            return ""
+
+        data = resp.json()
+        content = (
+            data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+        )
+        if not content:
+            print("[LLM ERROR] Leere Antwort vom Modell.")
+        return content
+
+    except requests.exceptions.MissingSchema:
+        print(f"[URL ERROR] Ungültige API-URL '{api_url}'.")
+        return ""
+    except requests.exceptions.ConnectionError:
+        print(f"[CONNECTION ERROR] Keine Verbindung zur API unter '{api_url}'.")
+        return ""
+    except Exception as e:
+        print(f"[EXCEPTION] Unerwarteter Fehler: {e}")
+        return ""
+
+# ----------------------------- Pipeline step ---------------------------
+
+try:
+    from src.pipeline.context import Context
+    from src.utils.logging import get_logger
+except Exception:
+    class Context: 
+        def __init__(self, cfg): 
+            self.cfg = cfg
+            self.artifacts = {}
+    def get_logger(name):
+        import logging; logging.basicConfig(level=logging.INFO); return logging.getLogger(name)
+
+class LLMAnswerer:
+    """
+    Pipeline step that:
+      1) Collects evidence from the copy_dir/manifest.json (your previous step).
+      2) Renders the prompt block with a strict context budget.
+      3) Calls the LLM.
+      4) Stores 'final_answer' and 'final_sources' in ctx.artifacts.
+    Config (ctx.cfg) expectations (sensible fallbacks):
+      paths.copy_dir              (required for evidence)
+      answer.query_text           (or query.text)
+      answer.{API_URL,API_KEY,MODEL_NAME}   (fallback to query.* if absent)
+      answer.max_ctx_chars        (optional)
+      answer.k                    (optional; default 20)
+    """
+    name = "LLM_Answerer"
+
+    def run(self, ctx: Context) -> None:
+        log = get_logger(self.name)
+
+        # --- config & fallbacks
+        paths          = ctx.cfg["paths"]
+        copy_dir       = paths["copy_dir"]
+        cfg_answer     = ctx.cfg.get("answer", {})
+        cfg_query      = ctx.cfg.get("query", {})
+        query_text     = (cfg_answer.get("query_text") 
+                          or cfg_query.get("text") 
+                          or ctx.artifacts.get("corrected_query") 
+                          or "").strip()
+
+        api_url        = cfg_answer.get("API_URL")   or cfg_query.get("API_URL")
+        api_key        = cfg_answer.get("API_KEY")   or cfg_query.get("API_KEY")
+        model_name     = cfg_answer.get("MODEL_NAME")or cfg_query.get("MODEL_NAME")
+        k              = int(cfg_answer.get("k", 20))
+        max_ctx_chars  = int(cfg_answer.get("max_ctx_chars", DEFAULT_MAX_CTX_CHARS))
+
+        if not query_text:
+            log.warning("No query_text found. Aborting answer generation.")
+            return
+        if not (api_url and api_key and model_name):
+            log.warning("Missing API config (API_URL/API_KEY/MODEL_NAME). Aborting.")
+            return
+
+        # --- collect & render evidence
+        items   = _collect_evidence_from_manifest(copy_dir, k=k)
+        block, sources = _render_evidence_block(items, budget=max_ctx_chars)
+
+        user_prompt = USER_INSTRUCTIONS.format(
+            query=query_text,
+            k=k,
+            evidence_block=block if block else "(keine Treffer im Kontext)",
+        )
+
+        # --- call LLM
+        content = _call_llm(
+            api_url=api_url,
+            api_key=api_key,
+            model=model_name,
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+        )
+
+        # --- postprocess: make sure the Sources footer is present
+        footer = _sources_footer(sources)
+        final_answer = (content.strip() + "\n\n" + footer).strip()
+
+        # --- export artifacts
+        ctx.artifacts["final_answer"]  = final_answer
+        ctx.artifacts["final_sources"] = footer
+
+        log.info("Answer generated (%d chars).", len(final_answer))
+
+How it fits your pipeline
+
+Input: the copy_dir/manifest.json produced by your LoadCopy step (you already write this).
+
+Prompt: German system prompt + the instruction block from your screenshot.
+Evidence is injected as:
+
+
+[1] /path/to/file | chunkname
+---
+<gekürzter Inhalt>
+
+[2] ...
+
+Budgeting: answer.max_ctx_chars (default 18000) keeps the context under control.
+
+LLM call: same error-handled requests.post style as your Query Rewriter.
+
+Outputs:
+
+ctx.artifacts["final_answer"] → the complete model answer + “Sources:” footer
+
+ctx.artifacts["final_sources"] → just the rendered “Sources:” list (useful for logging/UI)
+
+
+
+Minimal config snippet
+
+paths:
+  copy_dir: "artifacts/copy"              # from your LoadCopy step
+answer:
+  k: 20
+  max_ctx_chars: 18000
+  API_URL: "https://api.your-llm/v1/chat/completions"
+  API_KEY: "${LLM_API_KEY}"
+  MODEL_NAME: "gpt-4o-mini"               # or your hosted model
+  # query_text is optional; falls back to query.text or artifacts.corrected_query
+query:
+  text: "Wie extrahiere ich Achsgeometrie aus den Planunterlagen?"
+  API_URL: "https://api.your-llm/v1/chat/completions"
+  API_KEY: "${LLM_API_KEY}"
+  MODEL_NAME: "gpt-4o-mini"
+
+Using it
+
+Add it as a step after your LoadCopy (and after your retrieval/ranking), then call:
+
+step = LLMAnswerer()
+step.run(ctx)
+print(ctx.artifacts["final_answer"])
+
+If you want to feed ranked chunks directly (instead of reading manifest.json), you can replace _collect_evidence_from_manifest() with your retrieval artifacts—everything else remains the same.
+
