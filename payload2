@@ -1,0 +1,110 @@
+# src/search_steps/impls/generate_answer/build_payload.py
+from __future__ import annotations
+from pathlib import Path
+from typing import List
+import re
+
+INSTRUCTIONS = (
+    "Beantworten Sie die folgende Frage ausschließlich anhand der bereitgestellten Dateien. "
+    "Wenn eine Antwort gefunden wird, geben Sie nur die Antwort und den zugehörigen Pfad aus. "
+    "Keine zusätzlichen Erklärungen oder Kommentare. Falls keine Antwort in den Dateien "
+    "enthalten ist, geben Sie nichts aus."
+)
+
+PROV_MARK = "PROVENANCE-SOURCE-PATH"
+
+def _read_text_safe(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception:
+        return p.read_text(encoding="utf-8", errors="ignore")
+
+def _gather_files(copy_dir: str, k: int) -> List[Path]:
+    d = Path(copy_dir)
+    if not d.exists():
+        return []
+    files = [
+        p for p in d.iterdir()
+        if p.is_file()
+        and p.name != "manifest.json"
+        and p.suffix.lower() not in {".json", ".png", ".jpg", ".jpeg", ".gif", ".pdf"}
+    ]
+    files.sort()
+    return files[:k]
+
+def _normalize_newlines(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\n\s*\n+", "\n\n", text)  # collapse multiple blank lines
+    return text.strip("\n")
+
+def _strip_provenance_first_line(text: str) -> str:
+    """Remove the first line if it is the provenance header."""
+    lines = text.splitlines()
+    if lines and PROV_MARK in lines[0]:
+        lines = lines[1:]
+    return "\n".join(lines)
+
+def make_payload_text(copy_dir: str, query: str, k: int = 20, max_chars: int = 18_000) -> str:
+    """
+    Payload format:
+
+    Beantworten Sie …
+    Frage: [<query> ]
+
+    Dateien:
+    file:1. <absolute path>
+    Frage: [<query> ]
+    [
+    <file body without provenance line, cleaned>
+    ]
+
+    (one blank line between blocks)
+    """
+    header = f"{INSTRUCTIONS}\n\nFrage: [{query} ]\n\nDateien:\n"
+    remaining = max_chars - len(header)
+    if remaining <= 0:
+        return header.rstrip() + "\n"
+
+    blocks: List[str] = []
+    for i, p in enumerate(_gather_files(copy_dir, k), start=1):
+        raw = _read_text_safe(p)
+        if not raw:
+            continue
+
+        body_text = _normalize_newlines(_strip_provenance_first_line(raw))
+
+        # Build block header with file number + path, and repeat query
+        block_header = f"\nfile:{i}. {p}\nFrage: [{query} ]\n"
+        open_b, close_b = "[\n", "\n]"
+        fixed = len(block_header) + len(open_b) + len(close_b) + 1  # +1 trailing newline
+
+        if remaining <= fixed:
+            break
+
+        body_budget = remaining - fixed
+        if len(body_text) > body_budget:
+            head = body_text[: int(body_budget * 0.85)]
+            tail = body_text[-max(0, int(body_budget * 0.10)) :]
+            ellipsis = "\n...\n" if body_budget >= 4 else ""
+            body = (head + ellipsis + tail)[:body_budget]
+        else:
+            body = body_text
+
+        block = block_header + open_b + body + close_b + "\n"  # exactly one blank line after
+        blocks.append(block)
+        remaining -= len(block)
+        if remaining <= 0:
+            break
+
+    payload = header + "".join(blocks)
+    if len(payload) > max_chars:
+        payload = payload[: max_chars - 1] + "\n"
+    return payload
+
+def make_payload_file(copy_dir: str, query: str, out_file: str,
+                      k: int = 20, max_chars: int = 18_000) -> str:
+    payload = make_payload_text(copy_dir=copy_dir, query=query, k=k, max_chars=max_chars)
+    out_path = Path(out_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(payload, encoding="utf-8", newline="\n")
+    return str(out_path)
